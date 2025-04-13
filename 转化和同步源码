@@ -1,0 +1,442 @@
+import os
+import time
+import hashlib
+import json
+import shutil
+import comtypes.client
+import ctypes
+import psutil
+from collections import deque
+import threading
+import pypinyin
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import pandas as pd
+import requests
+import traceback
+from urllib.parse import urljoin
+
+# 配置部分
+CONFIG_FILE = "config.json"
+
+
+def load_config():
+    """加载并验证配置文件"""
+    if not os.path.exists(CONFIG_FILE):
+        raise FileNotFoundError(f"配置文件 {CONFIG_FILE} 不存在")
+
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:  # 显式指定编码为 utf-8
+            config = json.load(f)
+    except UnicodeDecodeError as e:
+        print(f"配置文件编码错误: {str(e)}")
+        print("请确保配置文件使用 UTF-8 编码")
+        raise
+
+    # 配置项验证
+    required_keys = ["API_BASE_URL", "TOKEN", "CONFIG_STORAGE_DIR", "FOLDER_KNOWLEDGE_MAP"]
+    for key in required_keys:
+        if key not in config:
+            raise ValueError(f"配置文件中缺少必需字段: {key}")
+
+    # 标准化API地址
+    if not config["API_BASE_URL"].endswith('/'):
+        config["API_BASE_URL"] += '/'
+
+    # 确保 CONFIG_STORAGE_DIR 存在
+    if not os.path.exists(config["CONFIG_STORAGE_DIR"]):
+        os.makedirs(config["CONFIG_STORAGE_DIR"], exist_ok=True)
+
+    # 设置持久化文件路径
+    config["PERSISTENCE_FILE"] = os.path.join(config["CONFIG_STORAGE_DIR"], "persistence.json")
+
+    return config
+
+
+# 工具函数
+def save_persistence(data, file_path):
+    """保存持久化数据"""
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:  # 显式指定编码为 utf-8
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"保存持久化文件失败: {str(e)}")
+
+
+def load_persistence(file_path):
+    """加载持久化数据"""
+    if not os.path.exists(file_path):
+        return {}
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:  # 显式指定编码为 utf-8
+            return json.load(f)
+    except Exception as e:
+        print(f"加载持久化文件失败: {str(e)}")
+        return {}
+
+
+def calculate_file_hash(file_path):
+    """计算文件的SHA256哈希"""
+    sha256 = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+    except Exception as e:
+        print(f"计算文件哈希失败: {file_path} - {str(e)}")
+        return None
+
+
+def is_file_in_use(file_path):
+    """使用psutil可靠检查文件是否被占用"""
+    try:
+        for proc in psutil.process_iter():
+            try:
+                files = proc.open_files()
+                if any(f.path == file_path for f in files):
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return False
+    except Exception as e:
+        print(f"检查文件占用状态失败: {str(e)}")
+        return True  # 保守策略，假设文件被占用
+
+
+def safe_rename(old_path, new_path, max_retries=3):
+    """安全的文件重命名函数"""
+    for _ in range(max_retries):
+        try:
+            os.rename(old_path, new_path)
+            return True
+        except PermissionError:
+            time.sleep(1)
+    return False
+
+
+class FileConverter:
+    @staticmethod
+    def convert_doc_to_docx(file_path, target_folder):
+        """转换Word文档，确保正确释放COM资源"""
+        word = None
+        doc = None
+        try:
+            file_name = os.path.basename(file_path)
+            base_name, ext = os.path.splitext(file_name)
+
+            if ext.lower() not in ['.doc', '.docx']:
+                return None
+
+            # 创建目标目录
+            os.makedirs(target_folder, exist_ok=True)
+            output_path = os.path.join(target_folder, f"{base_name}.docx")
+
+            # 如果是docx直接复制
+            if ext.lower() == '.docx':
+                shutil.copy(file_path, output_path)
+                print(f"已复制 DOCX 文件: {file_path} -> {output_path}")
+                return output_path
+
+            # 转换DOC到DOCX
+            print(f"开始转换 Word 文档: {file_path}")
+            word = comtypes.client.CreateObject('Word.Application')
+            word.Visible = False  # 非可视模式
+            doc = word.Documents.Open(file_path)
+            doc.SaveAs2(output_path, FileFormat=16)
+            print(f"成功转换 Word 文档: {output_path}")
+            return output_path
+        except Exception as e:
+            print(f"转换 Word 文档失败: {file_path}")
+            traceback.print_exc()
+            return None
+        finally:
+            # 确保释放资源
+            if doc:
+                doc.Close()
+            if word:
+                word.Quit()
+
+    @staticmethod
+    def convert_excel(file_path, target_folder):
+        """转换Excel文件"""
+        try:
+            file_name = os.path.basename(file_path)
+            base_name, ext = os.path.splitext(file_name)
+
+            if ext.lower() not in ['.xlsx', '.xls', '.csv']:
+                return None
+
+            os.makedirs(target_folder, exist_ok=True)
+            output_path = os.path.join(target_folder, f"{base_name}.csv")
+
+            # 处理Excel文件
+            if ext.lower() in ['.xlsx', '.xls']:
+                engine = 'openpyxl' if ext.lower() == '.xlsx' else 'xlrd'
+                df = pd.read_excel(file_path, engine=engine)
+                df.to_csv(output_path, index=False, encoding='utf-8-sig')
+                print(f"成功转换 Excel 文件: {output_path}")
+            else:  # CSV文件直接复制
+                shutil.copy(file_path, output_path)
+                print(f"已复制 CSV 文件: {output_path}")
+
+            return output_path
+        except Exception as e:
+            print(f"转换 Excel 文件失败: {file_path}")
+            traceback.print_exc()
+            return None
+
+    @staticmethod
+    def handle_pdf(file_path, target_folder):
+        """处理PDF文件"""
+        try:
+            os.makedirs(target_folder, exist_ok=True)
+            output_path = os.path.join(target_folder, os.path.basename(file_path))
+            shutil.copy(file_path, output_path)
+            print(f"已复制 PDF 文件: {output_path}")
+            return output_path
+        except Exception as e:
+            print(f"处理 PDF 文件失败: {file_path}")
+            traceback.print_exc()
+            return None
+
+
+class KnowledgeAPI:
+    def __init__(self, base_url, token):
+        self.base_url = base_url
+        self.headers = {
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/json'
+        }
+
+    def upload_file(self, file_path, knowledge_id):
+        """上传文件到知识库"""
+        try:
+            print(f"准备上传文件: {file_path}")
+            print(f"知识库ID: {knowledge_id}")
+
+            # 第一步：上传文件
+            upload_url = urljoin(self.base_url, "files/")
+            with open(file_path, 'rb') as f:
+                response = requests.post(
+                    upload_url,
+                    headers=self.headers,
+                    files={'file': (os.path.basename(file_path), f)},
+                    timeout=30
+                )
+
+            if response.status_code != 200:
+                print(f"文件上传失败: HTTP {response.status_code}")
+                print(f"响应内容: {response.text}")
+                return False
+
+            file_id = response.json().get('id')
+            print(f"文件上传成功，获得ID: {file_id}")
+
+            # 第二步：关联到知识库
+            relation_url = urljoin(self.base_url, f"knowledge/{knowledge_id}/file/add")
+            response = requests.post(
+                relation_url,
+                headers=self.headers,
+                json={'file_id': file_id}
+            )
+
+            if response.status_code != 200:
+                print(f"关联文件到知识库失败: HTTP {response.status_code}")
+                print(f"响应内容: {response.text}")
+                return False
+
+            print(f"文件成功关联到知识库 {knowledge_id}")
+            return True
+
+        except requests.exceptions.RequestException as e:
+            print(f"API请求失败: {str(e)}")
+            return False
+        except Exception as e:
+            traceback.print_exc()
+            return False
+
+
+class KnowledgeSyncHandler(FileSystemEventHandler):
+    def __init__(self, config):
+        self.config = config
+        self.persistence = load_persistence(config["PERSISTENCE_FILE"])
+        self.api = KnowledgeAPI(config["API_BASE_URL"], config["TOKEN"])
+        self.lock = threading.Lock()
+        self.file_queue = deque()
+        self.converted_dir = config["CONFIG_STORAGE_DIR"]
+        self.folder_map = config["FOLDER_KNOWLEDGE_MAP"]
+
+        # 初始化时创建目标目录
+        os.makedirs(self.converted_dir, exist_ok=True)
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._handle_file_event(event.src_path)
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            self._handle_file_event(event.src_path)
+
+    def _handle_file_event(self, path):
+        print(f"检测到文件变动: {path}")
+        with self.lock:
+            if path not in self.file_queue:
+                self.file_queue.append(path)
+
+    def process_queue(self):
+        while True:
+            if self.file_queue:
+                try:
+                    with self.lock:
+                        file_path = self.file_queue.popleft()
+                    self._process_file(file_path)
+                except Exception as e:
+                    traceback.print_exc()
+            time.sleep(1)
+
+    def _process_file(self, file_path):
+        print(f"\n{'=' * 40}")
+        print(f"开始处理文件: {file_path}")
+
+        try:
+            # 0. 基础检查
+            if not os.path.exists(file_path):
+                print(f"文件不存在: {file_path}")
+                return
+
+            # 1. 检查文件是否准备就绪
+            retry_count = 0
+            while retry_count < 5:
+                if is_file_in_use(file_path):
+                    print(f"文件被占用，等待... ({retry_count + 1}/5)")
+                    time.sleep(2)
+                    retry_count += 1
+                else:
+                    break
+            else:
+                print(f"文件仍被占用，跳过处理: {file_path}")
+                return
+
+            # 2. 计算哈希值
+            current_hash = calculate_file_hash(file_path)
+            if not current_hash:
+                return
+
+            # 3. 检查是否已处理过
+            if self.persistence.get(file_path) == current_hash:
+                print(f"文件未修改，跳过处理: {file_path}")
+                return
+
+            # 4. 确定知识库ID
+            knowledge_id = None
+            for folder, kid in self.folder_map.items():
+                if file_path.startswith(folder):
+                    knowledge_id = kid
+                    break
+            if not knowledge_id:
+                print(f"未找到对应的知识库映射: {file_path}")
+                return
+
+            print(f"关联知识库ID: {knowledge_id}")
+
+            # 5. 创建目标目录
+            folder_name = os.path.basename(os.path.dirname(file_path))
+            pinyin = ''.join([i[0] for i in pypinyin.pinyin(folder_name, style=pypinyin.Style.FIRST_LETTER)])
+            target_folder = os.path.join(self.converted_dir, pinyin)
+            os.makedirs(target_folder, exist_ok=True)
+            print(f"目标转换目录: {target_folder}")
+
+            # 6. 文件转换
+            _, ext = os.path.splitext(file_path)
+            converter_map = {
+                '.doc': FileConverter.convert_doc_to_docx,
+                '.docx': FileConverter.convert_doc_to_docx,
+                '.xls': FileConverter.convert_excel,
+                '.xlsx': FileConverter.convert_excel,
+                '.csv': FileConverter.convert_excel,
+                '.pdf': FileConverter.handle_pdf
+            }
+
+            convert_func = converter_map.get(ext.lower())
+            if not convert_func:
+                print(f"不支持的文件类型: {ext}")
+                return
+
+            converted_path = convert_func(file_path, target_folder)
+            if not converted_path:
+                print(f"文件转换失败: {file_path}")
+                return
+
+            # 7. 上传文件
+            if self.api.upload_file(converted_path, knowledge_id):
+                # 更新持久化记录
+                self.persistence[file_path] = current_hash
+                save_persistence(self.persistence, self.config["PERSISTENCE_FILE"])
+                print(f"文件处理完成: {file_path}")
+            else:
+                print(f"文件上传失败: {file_path}")
+
+        except Exception as e:
+            traceback.print_exc()
+            print(f"处理文件时发生错误: {file_path}")
+
+
+# 初始化函数
+def initialize_existing_files(handler):
+    """初始化处理现有文件"""
+    for folder in handler.folder_map.keys():
+        print(f"扫描历史文件: {folder}")
+        for root, _, files in os.walk(folder):
+            for file in files:
+                path = os.path.join(root, file)
+                handler._process_file(path)
+
+
+# 主程序
+def main():
+    observer = None  # 提前定义 observer，确保在 finally 块中可以访问
+    try:
+        config = load_config()
+        print("成功加载配置")
+
+        event_handler = KnowledgeSyncHandler(config)
+        observer = Observer()
+
+        # 添加监控路径
+        for folder in config["FOLDER_KNOWLEDGE_MAP"].keys():
+            if os.path.exists(folder):
+                observer.schedule(event_handler, folder, recursive=True)
+                print(f"已添加监控路径: {folder}")
+            else:
+                print(f"警告: 目录不存在 {folder}")
+
+        # 启动队列处理线程
+        processor_thread = threading.Thread(target=event_handler.process_queue)
+        processor_thread.daemon = True
+        processor_thread.start()
+
+        # 初始化处理已有文件
+        initialize_existing_files(event_handler)
+
+        observer.start()
+        print("监控服务已启动，按 Ctrl+C 退出")
+
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        if observer:
+            observer.stop()
+            print("\n正在停止监控服务...")
+    except Exception as e:
+        print(f"主程序运行时发生错误: {str(e)}")
+        if observer:
+            observer.stop()
+    finally:
+        if observer:
+            observer.join()
+        print("服务已安全停止")
+
+
+if __name__ == "__main__":
+    main()
