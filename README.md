@@ -1,2 +1,4 @@
-# Sync-to-openwebui
-sync files onto openwebui automatically
+经过几次小迭代，转化功能和同步功能已经被我整合到一起去了，并且封装成exe文件，请按照以下步骤来进行同步和上传功能的配置：
+1：下载程序包，解压完成后应该会看见两个exe文件，首先点击名为"填写配置文件"的exe文件，填写必要的信息：知识库接口、API Token、你期望配置文件的存放位置、你需要的知识库映射数量、填写完成后点击下一步，填写文件夹和知识库ID的对应关系（知识库ID的位置我在文章中写了的，如果找不到可以访问lijiong.online进行查找）然后点击保存，回到主页面再点一次保存，最后×掉这个窗口，路径配置就完成了。
+<img width="684" alt="b0d701de16aba68adde6f8a23481abd" src="https://github.com/user-attachments/assets/1adddff7-19ef-44b6-9cca-cc63e9a78431" />
+2.将另一个名为Sync-OpenWebUI的exe文件添加到Windows任务计划程序中，设置为开机延时2min启动（等待Open web UI启动以防出现bug），重启电脑查看任务管理器中这个程序进程是否正常，如果正常文件应该正常被转化和上传到知识库中。转化后的文件存在你设置的配置文件储存地址。中文文件夹被重命名为拼音简写。
