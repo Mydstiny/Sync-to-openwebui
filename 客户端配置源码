@@ -1,0 +1,305 @@
+import os
+import json
+import tkinter as tk
+from tkinter import messagebox, ttk
+from pathlib import Path
+import logging
+import uuid
+from tkinter import scrolledtext
+import requests  # 确保安装了 requests 库
+
+DEFAULT_CONFIG = {
+    "API_BASE_URL": "http://localhost:3000/api/v1/",
+    "TOKEN": "sk-default-token",
+    "FOLDER_KNOWLEDGE_MAP": {},
+    "CONFIG_STORAGE_DIR": str(Path.home() / "file_sync_config")
+}
+
+class EnhancedJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Path):
+            return str(obj)
+        return super().default(obj)
+
+class Application:
+    def __init__(self):
+        self.config = self.load_config()
+        self.setup_paths()
+        self.root = self.create_root()
+        self.create_widgets()
+        self.setup_logging()
+        self.folder_entries = []
+        self.knowledge_entries = []
+
+    def run(self):
+        """启动主事件循环"""
+        self.root.mainloop()
+
+    def setup_logging(self):
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s [%(levelname)s] %(message)s',
+            handlers=[LogHandler(self.log_text)]
+        )
+
+    def create_root(self):
+        root = tk.Tk()
+        root.title("文件同步客户端")
+        root.geometry("910x550")
+        root.grid_columnconfigure(0, weight=1)
+        root.grid_rowconfigure(0, weight=1)
+        return root
+
+    def load_config(self):
+        config_path = Path("config.json")
+        try:
+            if config_path.exists():
+                with config_path.open("r", encoding="utf-8") as f:
+                    config = json.load(f)
+                return self.validate_config(config)
+            return DEFAULT_CONFIG.copy()
+        except (json.JSONDecodeError, PermissionError) as e:
+            logging.error(f"配置加载失败: {str(e)}")
+            return DEFAULT_CONFIG.copy()
+
+    def validate_config(self, config):
+        validated = DEFAULT_CONFIG.copy()
+
+        # 合并配置项
+        for key in validated:
+            if key in config:
+                validated[key] = config[key]
+
+        # 路径处理
+        try:
+            storage_dir = Path(validated["CONFIG_STORAGE_DIR"]).resolve()
+            storage_dir.mkdir(parents=True, exist_ok=True)
+            validated["CONFIG_STORAGE_DIR"] = str(storage_dir)
+        except Exception as e:
+            logging.error(f"配置目录错误: {e}")
+            validated["CONFIG_STORAGE_DIR"] = DEFAULT_CONFIG["CONFIG_STORAGE_DIR"]
+
+        # 清理知识库映射
+        validated["FOLDER_KNOWLEDGE_MAP"] = {
+            str(Path(k).resolve()): v.strip()
+            for k, v in validated.get("FOLDER_KNOWLEDGE_MAP", {}).items()
+            if Path(k).exists() and self.is_valid_uuid(v.strip())
+        }
+
+        return validated
+
+    def is_valid_uuid(self, uuid_str):
+        try:
+            uuid.UUID(uuid_str)
+            return True
+        except ValueError:
+            return False
+
+    def setup_paths(self):
+        base_dir = Path(self.config["CONFIG_STORAGE_DIR"])
+        self.config.update({
+            "PERSISTENCE_FILE": str(base_dir / "persistence.txt"),
+            "HASH_STORAGE_DIR": str(base_dir),
+            "CONVERTED_DIR": str(base_dir / "converted_files")
+        })
+        Path(self.config["CONVERTED_DIR"]).mkdir(parents=True, exist_ok=True)
+
+    def create_widgets(self):
+        main_frame = ttk.Frame(self.root, padding=15)
+        main_frame.grid(row=0, column=0, sticky="nsew")
+
+        # 输入字段
+        fields = [
+            ("API地址:", "api_base_url_entry", self.config["API_BASE_URL"]),
+            ("访问令牌:", "token_entry", self.config["TOKEN"]),
+            ("配置存储目录:", "config_storage_dir_entry", self.config["CONFIG_STORAGE_DIR"]),
+            ("监控目录数量:", "num_knowledges_entry", len(self.config["FOLDER_KNOWLEDGE_MAP"]))
+        ]
+
+        self.widgets = {}
+        for row, (label, name, value) in enumerate(fields):
+            ttk.Label(main_frame, text=label).grid(row=row, column=0, sticky="e", padx=10, pady=8)
+            entry = ttk.Entry(main_frame, width=70)
+            entry.insert(0, value)
+            entry.grid(row=row, column=1, padx=10, pady=8)
+            self.widgets[name] = entry
+
+        # 按钮区域
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=15)
+
+        ttk.Button(btn_frame, text="下一步", command=self.show_config_page).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="保存配置", command=self.save_configuration).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="测试连接", command=self.test_connection).pack(side=tk.LEFT, padx=10)
+
+        # 日志区域
+        self.log_text = scrolledtext.ScrolledText(
+            main_frame,
+            width=110,
+            height=15,
+            font=("微软雅黑", 10)
+        )
+        self.log_text.grid(row=5, column=0, columnspan=2, pady=10)
+
+    def show_config_page(self):
+        try:
+            num = int(self.widgets["num_knowledges_entry"].get())
+            if num < 0:
+                raise ValueError("数量不能为负数")
+        except ValueError as e:
+            messagebox.showerror("输入错误", f"无效的数值输入: {e}")
+            return
+
+        config_win = tk.Toplevel(self.root)
+        config_win.title("目录配置")
+        config_win.geometry("900x600")
+
+        # 滚动容器
+        canvas = tk.Canvas(config_win, borderwidth=0)
+        scrollbar = ttk.Scrollbar(config_win, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(
+            scrollregion=canvas.bbox("all"))
+                          )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # 动态生成配置项
+        self.folder_entries = []
+        self.knowledge_entries = []
+
+        # 加载已有配置
+        existing_config = list(self.config["FOLDER_KNOWLEDGE_MAP"].items())
+
+        for i in range(num):
+            ttk.Label(scroll_frame, text=f"监控目录 {i + 1}:").grid(
+                row=i, column=0, padx=10, pady=5, sticky="e")
+
+            folder_entry = ttk.Entry(scroll_frame, width=60)
+            if i < len(existing_config):
+                folder_entry.insert(0, existing_config[i][0])
+            folder_entry.grid(row=i, column=1, padx=10, pady=5)
+
+            ttk.Label(scroll_frame, text="知识库ID:").grid(
+                row=i, column=2, padx=10, pady=5, sticky="e")
+
+            knowledge_entry = ttk.Entry(scroll_frame, width=36)
+            if i < len(existing_config):
+                knowledge_entry.insert(0, existing_config[i][1])
+            knowledge_entry.grid(row=i, column=3, padx=10, pady=5)
+
+            self.folder_entries.append(folder_entry)
+            self.knowledge_entries.append(knowledge_entry)
+
+        # 保存按钮
+        ttk.Button(scroll_frame, text="保存配置",
+                   command=self.save_configuration).grid(
+            row=num + 1, column=1, columnspan=3, pady=20)
+
+    def save_configuration(self):
+        new_config = {
+            "API_BASE_URL": self.widgets["api_base_url_entry"].get().strip(),
+            "TOKEN": self.widgets["token_entry"].get().strip(),
+            "CONFIG_STORAGE_DIR": self.widgets["config_storage_dir_entry"].get().strip(),
+            "FOLDER_KNOWLEDGE_MAP": {}
+        }
+
+        # 验证存储目录
+        try:
+            storage_dir = Path(new_config["CONFIG_STORAGE_DIR"])
+            storage_dir.mkdir(parents=True, exist_ok=True)
+            if not storage_dir.is_dir():
+                raise ValueError("路径不是有效的目录")
+            new_config["CONFIG_STORAGE_DIR"] = str(storage_dir.resolve())
+        except Exception as e:
+            logging.error(f"目录验证失败: {e}")
+            messagebox.showerror("配置错误", f"无效的存储目录: {e}")
+            return
+
+        # 收集路径映射
+        valid_pairs = []
+        for i, (folder_entry, knowledge_entry) in enumerate(zip(self.folder_entries, self.knowledge_entries)):
+            try:
+                folder_path = Path(folder_entry.get().strip()).resolve()
+                knowledge_id = knowledge_entry.get().strip()
+
+                if not folder_path.exists():
+                    logging.warning(f"忽略不存在的目录: {folder_path}")
+                    messagebox.showwarning("警告", f"目录 {folder_path} 不存在，已忽略")
+                    continue
+
+                if not self.is_valid_uuid(knowledge_id):
+                    logging.warning(f"无效的知识库ID: {knowledge_id}")
+                    messagebox.showwarning("警告", f"知识库ID {knowledge_id} 格式无效，已忽略")
+                    continue
+
+                valid_pairs.append((str(folder_path), knowledge_id))
+            except Exception as e:
+                logging.error(f"处理路径时出错: {e}")
+                messagebox.showerror("配置错误", f"处理路径时出错: {e}")
+                return
+
+        new_config["FOLDER_KNOWLEDGE_MAP"] = dict(valid_pairs)
+
+        # 保存到文件
+        try:
+            with open("config.json", "w", encoding="utf-8") as f:
+                json.dump(new_config, f, indent=2, ensure_ascii=False, cls=EnhancedJSONEncoder)
+
+            self.config = self.validate_config(new_config)
+            logging.info("配置保存成功")
+            messagebox.showinfo("成功", "配置已更新")
+        except PermissionError:
+            logging.error("没有权限写入配置文件")
+            messagebox.showerror("错误", "没有权限写入配置文件")
+        except Exception as e:
+            logging.error(f"配置保存失败: {e}")
+            messagebox.showerror("错误", f"保存失败: {e}")
+
+    def test_connection(self):
+        """测试API连接"""
+        url = f"{self.config['API_BASE_URL'].rstrip('/')}/ping"
+        headers = {"Authorization": f"Bearer {self.config['TOKEN']}"}
+
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                messagebox.showinfo("连接测试", "API连接成功！")
+            else:
+                messagebox.showerror("连接测试",
+                                     f"连接失败: {response.status_code}\n{response.text}")
+        except Exception as e:
+            messagebox.showerror("连接测试", f"连接异常: {str(e)}")
+
+
+class LogHandler(logging.Handler):
+    def __init__(self, text_widget):
+        super().__init__()
+        self.text_widget = text_widget
+        self.formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.text_widget.configure(state="normal")
+            self.text_widget.insert("end", msg + "\n")
+            self.text_widget.configure(state="disabled")
+            self.text_widget.see("end")
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    # Windows系统控制台中文支持
+    if os.name == 'nt':
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleOutputCP(65001)
+
+    app = Application()
+    app.run()
